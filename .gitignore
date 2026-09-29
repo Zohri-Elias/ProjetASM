@@ -1,0 +1,6 @@
+# Binaires compilés (on ne versionne que le code source)
+cobaye
+lire_elf
+lire_phdr
+elf_parser
+*.o
