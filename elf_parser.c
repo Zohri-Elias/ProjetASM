@@ -114,17 +114,21 @@ static int afficher_program_headers(FILE *f, const Elf64_Ehdr *ehdr) {
  * PARTIE 2 — CASE 3 : stub anti-debug (Protected ELF)
  * ============================================================ */
 #ifdef PROTECTED_ELF
-/* ptrace(PTRACE_TRACEME) → si retour == -1 → debugger attaché → exit */
+/* ptrace(PTRACE_TRACEME) → si retour == -1 → debugger attaché → exit(60)
+ *
+ * ⚠️ Important : le "jne" doit sauter 5 octets (taille du bloc exit),
+ *                PAS 6 — sinon on atterrit au milieu du prologue suivant.
+ */
 static const unsigned char stub_antidebug[] = {
-    0x48, 0xC7, 0xC0, 0x65, 0x00, 0x00, 0x00,   /* mov rax, 101    */
-    0x48, 0x31, 0xFF,                            /* xor rdi, rdi    */
-    0x48, 0x31, 0xF6,                            /* xor rsi, rsi    */
-    0x48, 0x31, 0xD2,                            /* xor rdx, rdx    */
-    0x49, 0x31, 0xD2,                            /* xor r10, r10    */
-    0x0F, 0x05,                                  /* syscall         */
-    0x48, 0x83, 0xF8, 0xFF,                      /* cmp rax, -1     */
-    0x75, 0x06,                                  /* jne continuer   */
-    0x6A, 0x3C, 0x58, 0x0F, 0x05                 /* exit(60)        */
+    0x48, 0xC7, 0xC0, 0x65, 0x00, 0x00, 0x00,   /* mov rax, 101         */
+    0x48, 0x31, 0xFF,                            /* xor rdi, rdi         */
+    0x48, 0x31, 0xF6,                            /* xor rsi, rsi         */
+    0x48, 0x31, 0xD2,                            /* xor rdx, rdx         */
+    0x49, 0x31, 0xD2,                            /* xor r10, r10         */
+    0x0F, 0x05,                                  /* syscall              */
+    0x48, 0x83, 0xF8, 0xFF,                      /* cmp rax, -1          */
+    0x75, 0x05,                                  /* jne +5 (continuer)   */
+    0x6A, 0x3C, 0x58, 0x0F, 0x05                 /* exit(60)             */
 };
 #endif
 
